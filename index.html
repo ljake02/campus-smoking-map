@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>캠퍼스 흡연 구역 알리미</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 네이버 지도 API는 아래 코드에서 로드 완료 후 초기화합니다. -->
+    <style>
+        /* 지도 영역 높이 설정 (flex-grow를 활용해 자동 조정) */
+        #map { width: 100%; border-radius: 0; z-index: 1; }
+        /* 네이버 지도 정보창 스타일링 */
+        .iw_inner { padding: 10px; font-size: 14px; border-radius: 8px; background: white; border: 1px solid #ccc; color: #333; }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="max-w-md mx-auto bg-white min-h-screen shadow-lg flex flex-col relative overflow-hidden">
+        
+        <!-- 헤더 영역 -->
+        <header class="bg-blue-600 text-white p-4 shadow-md z-10 flex justify-between items-center">
+            <div>
+                <h1 class="text-xl font-bold">🚬 흡연 구역 찾기</h1>
+            </div>
+            <button id="admin-open-btn" class="text-xs bg-blue-700 hover:bg-blue-800 text-white py-1 px-2 rounded border border-blue-500 transition shadow-sm">⚙️ 관리자</button>
+        </header>
+
+        <!-- 검색 영역 (사용자 화면) -->
+        <div class="p-4 bg-white shadow-sm z-10 relative border-b border-gray-100">
+            <label for="departure-input" class="block text-xs font-bold text-gray-600 mb-1">출발지 입력</label>
+            <div class="flex gap-2">
+                <button id="btn-gps" class="bg-gray-100 p-3 rounded-lg border border-gray-300 hover:bg-gray-200 transition flex-shrink-0" title="현재 위치 가져오기">
+                    📍
+                </button>
+                <input type="text" id="departure-input" class="flex-1 border border-gray-300 p-3 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="주소를 입력하세요 (예: 강남대로 123)">
+                <button id="btn-search" class="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-3 rounded-lg transition shadow flex-shrink-0">찾기</button>
+            </div>
+        </div>
+
+        <!-- 결과 표시 패널 -->
+        <div id="result-panel" class="hidden px-4 py-3 bg-blue-50 border-b border-blue-100 text-sm text-gray-700 z-10 shadow-inner"></div>
+
+        <!-- 지도 영역 -->
+        <div id="map" class="flex-grow w-full relative z-0" style="min-height: 50vh;"></div>
+
+        <!-- 관리자 모달 (기본 숨김) -->
+        <div id="admin-modal" class="hidden absolute inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+            <div class="bg-white rounded-lg shadow-xl w-full max-w-sm flex flex-col">
+                <div class="p-4 border-b flex justify-between items-center bg-gray-50 rounded-t-lg">
+                    <h2 class="font-bold text-gray-800">⚙️ 관리자 설정</h2>
+                    <button id="admin-close-btn" class="text-gray-500 hover:text-gray-800 text-xl font-bold">&times;</button>
+                </div>
+                <div class="p-4">
+                    <h3 class="font-bold text-gray-800 mb-2 text-sm">📁 흡연 구역 데이터 업로드</h3>
+                    <p class="text-xs text-gray-500 mb-4">텍스트 파일(.txt) 내용 형식:<br><code class="bg-gray-100 px-1 rounded block mt-1">장소이름: 위도, 경도</code></p>
+                    <input type="file" id="data-file-upload" accept=".txt" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                    
+                    <div class="mt-6">
+                        <h3 class="font-bold text-gray-700 text-xs mb-2">등록된 흡연 구역 목록</h3>
+                        <ul id="smoking-area-list" class="space-y-1 text-xs text-gray-600 max-h-40 overflow-y-auto bg-gray-50 p-2 rounded border border-gray-200">
+                            <li class="text-gray-400 text-center py-2">데이터가 없습니다.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // 1. 데이터 저장 (딕셔너리 형태: '장소 이름' : [위도, 경도])
+        let smokingAreas = {};
+        const DEFAULT_SMOKING_AREAS = { '생명과학관 주차장': [37.54127, 127.07441] };
+        const SMOKING_AREAS_STORAGE_KEY = 'campusSmokingAreas_v1';
+
+        // 초기 지도 중심 좌표
+        let initialCenter = null;
+        let map;
+        let userMarker;
+        let markers = [];
+        let infoWindows = [];
+        let smokingAreaMarkers = {};
+        let closestAreaMarkerName = null;
+        
+        // 현재 사용자가 지정한(또는 검색한) 출발지 좌표
+        let currentUserLatLng = null; 
+
+        // 2. 지도 초기화
+        function initMap() {
+            if (!window.naver || !naver.maps || !naver.maps.Map) {
+                showMapError('네이버 지도 API가 로드되었지만 지도 기능을 사용할 수 없습니다. 네이버 클라우드 플랫폼의 Maps API 설정을 확인해주세요.');
+                return;
+            }
+            try {
+                initialCenter = new naver.maps.LatLng(37.5665, 126.9780);
+                map = new naver.maps.Map('map', {
+                    center: initialCenter,
+                    zoom: 15
+                });
+            } catch (error) {
+                console.error('지도 초기화 오류:', error);
+                showMapError('지도를 초기화하지 못했습니다. 네이버 지도 API 키와 웹 서비스 URL 등록 상태를 확인해주세요.');
+                return;
+            }
+            
+            // 저장된 관리자 목록이 있으면 복원하고, 없으면 웹사이트 기본 목록을 사용합니다.
+            let initialData = DEFAULT_SMOKING_AREAS;
+            try {
+                const saved = localStorage.getItem(SMOKING_AREAS_STORAGE_KEY);
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length) initialData = parsed;
+                }
+            } catch (error) { console.warn('저장된 흡연 구역을 불러오지 못했습니다.', error); }
+            renderSmokingAreas(initialData);
+            // 페이지 로드 시 현재 위치 가져오기 시도
+            fetchCurrentLocation();
+        }
+        
+        // 관리자 모달 제어
+        document.getElementById('admin-open-btn').addEventListener('click', () => {
+            document.getElementById('admin-modal').classList.remove('hidden');
+        });
+        document.getElementById('admin-close-btn').addEventListener('click', () => {
+            document.getElementById('admin-modal').classList.add('hidden');
+        });
+
+        // txt 파일 처리 로직
+        document.getElementById('data-file-upload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const contents = e.target.result;
+                parseDataAndUpdateMap(contents);
+            };
+            reader.readAsText(file, 'utf-8');
+        });
+
+        function parseDataAndUpdateMap(textData) {
+            const parsedAreas = {};
+            const lines = textData.split(/\r?\n/);
+            lines.forEach(line => {
+                if (!line.trim()) return;
+                const colonIndex = line.indexOf(':');
+                if (colonIndex < 0) return;
+                const name = line.slice(0, colonIndex).trim();
+                const coords = line.slice(colonIndex + 1).split(',');
+                if (!name || coords.length < 2) return;
+                const lat = parseFloat(coords[0].trim());
+                const lng = parseFloat(coords[1].trim());
+                if (Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+                    parsedAreas[name] = [lat, lng];
+                }
+            });
+            if (!Object.keys(parsedAreas).length) {
+                alert('올바른 형식의 데이터를 찾지 못했습니다. 예: 장소이름: 37.123, 127.123');
+                return;
+            }
+            try { localStorage.setItem(SMOKING_AREAS_STORAGE_KEY, JSON.stringify(parsedAreas)); }
+            catch (error) { console.warn('브라우저 저장 실패:', error); }
+            renderSmokingAreas(parsedAreas);
+            alert('흡연 구역 목록이 업데이트되었습니다. 이 브라우저에서 다시 열어도 유지됩니다.');
+        }
+
+        function renderSmokingAreas(areas) {
+            markers.forEach(marker => marker.setMap(null));
+            markers = [];
+            infoWindows = [];
+            smokingAreaMarkers = {};
+            closestAreaMarkerName = null;
+            smokingAreas = {};
+            const listContainer = document.getElementById('smoking-area-list');
+            listContainer.innerHTML = '';
+            for (const [name, coords] of Object.entries(areas)) {
+                if (!Array.isArray(coords) || coords.length < 2) continue;
+                const lat = Number(coords[0]), lng = Number(coords[1]);
+                if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+                smokingAreas[name] = [lat, lng];
+                const position = new naver.maps.LatLng(lat, lng);
+                const marker = new naver.maps.Marker({
+                    position,
+                    map,
+                    title: name,
+                    icon: createSmokingAreaIcon(false)
+                });
+                smokingAreaMarkers[name] = marker;
+                const infoWindow = new naver.maps.InfoWindow({
+                    content: `<div class="iw_inner shadow-md"><b>${escapeHtml(name)}</b><br>흡연 구역</div>`,
+                    borderWidth: 0, backgroundColor: 'transparent', disableAnchor: true
+                });
+                naver.maps.Event.addListener(marker, 'click', function() {
+                    if (infoWindow.getMap()) infoWindow.close(); else infoWindow.open(map, marker);
+                });
+                markers.push(marker); infoWindows.push(infoWindow);
+                const li = document.createElement('li');
+                li.className = 'flex items-center gap-2 py-1';
+                const dot = document.createElement('span'); dot.className = 'w-2 h-2 bg-blue-500 rounded-full flex-shrink-0';
+                const label = document.createElement('span'); label.className = 'truncate'; label.textContent = name;
+                li.append(dot, label); listContainer.appendChild(li);
+            }
+        }
+
+        function escapeHtml(value) {
+            return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+        }
+
+        // 일반 흡연 구역은 작은 점, 최단 거리 검색 결과는 더 큰 핀 모양으로 표시합니다.
+        function createSmokingAreaIcon(isClosest) {
+            if (!isClosest) {
+                return {
+                    content: '<div style="width:10px;height:10px;background:#2563eb;border:2px solid #fff;border-radius:50%;box-shadow:0 1px 4px rgba(0,0,0,.45);"></div>',
+                    size: new naver.maps.Size(10, 10),
+                    anchor: new naver.maps.Point(5, 5)
+                };
+            }
+            return {
+                content: '<svg width="38" height="48" viewBox="0 0 38 48" xmlns="http://www.w3.org/2000/svg" style="overflow:visible;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))"><path d="M19 1C9.1 1 1 9.1 1 19c0 13 18 28 18 28s18-15 18-28C37 9.1 28.9 1 19 1Z" fill="#ef4444" stroke="#fff" stroke-width="2"/><circle cx="19" cy="19" r="7" fill="#fff"/><circle cx="19" cy="19" r="3" fill="#ef4444"/></svg>',
+                size: new naver.maps.Size(38, 48),
+                anchor: new naver.maps.Point(19, 48)
+            };
+        }
+
+        function highlightClosestSmokingArea(name) {
+            // 이전에 강조했던 마커를 일반 작은 점으로 되돌립니다.
+            Object.entries(smokingAreaMarkers).forEach(([areaName, marker]) => {
+                marker.setIcon(createSmokingAreaIcon(areaName === name));
+                marker.setZIndex(areaName === name ? 1000 : 1);
+            });
+            closestAreaMarkerName = name;
+        }
+
+        // 3. 거리 계산 함수 (하버사인 공식)
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371; // 지구 반경 (km)
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = 
+                Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c * 1000; // 미터(m) 단위로 반환
+        }
+
+        // 4. GPS 위치 가져오기 및 역지오코딩
+        function fetchCurrentLocation() {
+            const inputEl = document.getElementById('departure-input');
+            inputEl.value = "위치 확인 중...";
+            
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        currentUserLatLng = new naver.maps.LatLng(lat, lng);
+                        
+                        updateUserMarker(currentUserLatLng);
+                        map.setCenter(currentUserLatLng);
+
+                        // 역지오코딩으로 현재 위치 주소 가져오기
+                        if (naver.maps.Service && naver.maps.Service.reverseGeocode) {
+                            naver.maps.Service.reverseGeocode({
+                                coords: currentUserLatLng,
+                            }, function(status, response) {
+                                if (status === naver.maps.Service.Status.OK && response.v2.address) {
+                                    const addr = response.v2.address;
+                                    // 지번 주소나 도로명 주소 매핑
+                                    inputEl.value = addr.roadAddress || addr.jibunAddress || "내 현재 위치";
+                                } else {
+                                    inputEl.value = "내 현재 위치 (GPS)";
+                                }
+                            });
+                        } else {
+                            inputEl.value = "내 현재 위치 (GPS)";
+                        }
+                    },
+                    (error) => {
+                        inputEl.value = "";
+                        inputEl.placeholder = "위치를 가져올 수 없습니다. 주소를 직접 입력해주세요.";
+                    },
+                    { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+                );
+            } else {
+                inputEl.value = "";
+                inputEl.placeholder = "GPS를 지원하지 않는 브라우저입니다.";
+            }
+        }
+
+        // GPS 버튼 클릭 이벤트
+        document.getElementById('btn-gps').addEventListener('click', fetchCurrentLocation);
+
+        // 유저 마커 생성/업데이트
+        function updateUserMarker(latLng) {
+            if (userMarker) userMarker.setMap(null);
+            userMarker = new naver.maps.Marker({
+                position: latLng,
+                map: map,
+                icon: {
+                    content: '<div style="background-color:#ef4444; width:16px; height:16px; border-radius:50%; border:2px solid white; box-shadow: 0 0 5px rgba(0,0,0,0.5);"></div>',
+                    anchor: new naver.maps.Point(8, 8)
+                }
+            });
+        }
+
+        // 5. 검색 및 가장 가까운 장소 찾기
+        document.getElementById('btn-search').addEventListener('click', () => {
+            const inputVal = document.getElementById('departure-input').value.trim();
+            const resultPanel = document.getElementById('result-panel');
+            
+            if (Object.keys(smokingAreas).length === 0) {
+                resultPanel.classList.remove('hidden');
+                resultPanel.innerHTML = `<span class="text-red-500 font-bold">등록된 흡연 구역이 없습니다. 우측 상단 '관리자'에서 데이터를 업로드해주세요.</span>`;
+                return;
+            }
+
+            if (!inputVal) {
+                resultPanel.classList.remove('hidden');
+                resultPanel.innerHTML = `<span class="text-red-500 font-bold">출발지를 입력해주세요.</span>`;
+                return;
+            }
+
+            // 입력값이 "내 현재 위치" 등을 포함하고 GPS 좌표가 있는 경우, 기존 좌표를 활용
+            if ((inputVal.includes("내 현재 위치") || inputVal.includes("GPS")) && currentUserLatLng) {
+                findNearest(currentUserLatLng.lat(), currentUserLatLng.lng());
+            } else {
+                // 사용자가 직접 주소를 수정한 경우 지오코딩 API 호출
+                resultPanel.classList.remove('hidden');
+                resultPanel.innerHTML = `<span class="text-blue-600">주소를 검색 중입니다...</span>`;
+                
+                if (naver.maps.Service && naver.maps.Service.geocode) {
+                    naver.maps.Service.geocode({ query: inputVal }, function(status, response) {
+                        if (status === naver.maps.Service.Status.OK && response.v2.addresses.length > 0) {
+                            const item = response.v2.addresses[0];
+                            currentUserLatLng = new naver.maps.LatLng(item.y, item.x);
+                            updateUserMarker(currentUserLatLng);
+                            findNearest(item.y, item.x);
+                        } else {
+                            resultPanel.innerHTML = `<span class="text-red-500 font-bold">주소를 찾을 수 없거나 결과가 없습니다. 도로명/지번 주소를 정확히 입력해주세요.</span>`;
+                        }
+                    });
+                } else {
+                    resultPanel.innerHTML = `<span class="text-red-500 font-bold">주소 검색 기능을 사용할 수 없습니다. NCloud 콘솔에서 'Geocoding' 서비스 활성화 여부를 확인해주세요.</span>`;
+                }
+            }
+        });
+
+        // 가까운 흡연 구역 계산 로직
+        function findNearest(lat, lng) {
+            let minDistance = Infinity;
+            let closestAreaName = "";
+            let closestCoords = [];
+
+            for (const [name, coords] of Object.entries(smokingAreas)) {
+                const dist = getDistance(lat, lng, coords[0], coords[1]);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    closestAreaName = name;
+                    closestCoords = coords;
+                }
+            }
+
+            const resultPanel = document.getElementById('result-panel');
+            if (closestAreaName) {
+                highlightClosestSmokingArea(closestAreaName);
+                resultPanel.classList.remove('hidden');
+                resultPanel.innerHTML = `
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <span class="text-gray-500 text-xs">가장 가까운 곳</span><br>
+                            <span class="text-lg text-blue-700 font-bold">${closestAreaName}</span>
+                        </div>
+                        <div class="text-right">
+                            <span class="text-gray-500 text-xs">직선 거리</span><br>
+                            <span class="font-bold text-gray-800">약 ${Math.round(minDistance)}m</span>
+                        </div>
+                    </div>
+                `;
+
+                // 출발지와 도착지가 모두 보이게 지도 범위 조정
+                const targetPosition = new naver.maps.LatLng(closestCoords[0], closestCoords[1]);
+                const bounds = new naver.maps.LatLngBounds(currentUserLatLng, currentUserLatLng);
+                bounds.extend(targetPosition);
+                
+                map.fitBounds(bounds, { margin: 50 });
+            }
+        }
+
+        // 지도 오류를 지도 영역 안에 표시합니다.
+        function showMapError(message) {
+            const mapEl = document.getElementById('map');
+            mapEl.innerHTML = '';
+            mapEl.style.minHeight = '50vh';
+            const box = document.createElement('div');
+            box.className = 'flex items-center justify-center h-full bg-gray-100 text-gray-700 text-center p-6';
+            box.style.minHeight = '50vh';
+            const content = document.createElement('div');
+            const title = document.createElement('div');
+            title.className = 'font-bold mb-2';
+            title.textContent = '지도를 불러오지 못했습니다.';
+            const detail = document.createElement('p');
+            detail.className = 'text-sm';
+            detail.textContent = message;
+            const hint = document.createElement('p');
+            hint.className = 'text-xs mt-3 text-gray-500';
+            hint.textContent = 'GitHub Pages 주소가 네이버 클라우드 플랫폼의 지도 API 웹 서비스 URL에 등록되어 있는지도 확인해주세요.';
+            content.append(title, detail, hint);
+            box.appendChild(content);
+            mapEl.appendChild(box);
+        }
+
+        // API 스크립트를 비동기로 불러온 다음 지도 초기화
+        window.addEventListener('load', () => {
+            const mapEl = document.getElementById('map');
+            mapEl.textContent = '네이버 지도를 불러오는 중입니다…';
+            mapEl.classList.add('flex', 'items-center', 'justify-center', 'bg-gray-100', 'text-gray-500');
+            const script = document.createElement('script');
+            script.src = 'https://openapi.map.naver.com/openapi/v3/maps.js?ncpKeyId=bzm8sq5bqr&submodules=geocoder';
+            script.async = true;
+            script.onload = () => {
+                mapEl.textContent = '';
+                mapEl.classList.remove('flex', 'items-center', 'justify-center', 'bg-gray-100', 'text-gray-500');
+                if (!window.naver || !window.naver.maps) {
+                    showMapError('지도 API 스크립트는 내려받았지만 지도 객체가 생성되지 않았습니다. API 키 설정을 확인해주세요.');
+                    return;
+                }
+                initMap();
+            };
+            script.onerror = () => {
+                showMapError('네이버 지도 API 스크립트를 불러오지 못했습니다. 인터넷 연결, API 키, Maps 서비스 이용 설정을 확인해주세요.');
+            };
+            document.head.appendChild(script);
+        });
+    </script>
+</body>
+</html>
